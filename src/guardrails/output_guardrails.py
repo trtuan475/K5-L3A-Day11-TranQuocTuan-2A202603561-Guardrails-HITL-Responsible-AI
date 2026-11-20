@@ -11,6 +11,7 @@ from google.genai import types
 from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
+from google.adk.models.llm_response import LlmResponse
 
 from core.utils import chat_with_agent
 
@@ -28,32 +29,30 @@ from core.utils import chat_with_agent
 # ============================================================
 
 def content_filter(response: str) -> dict:
-    """Filter response for PII, secrets, and harmful content.
+    """Filter response for PII, secrets, and sensitive information."""
 
-    Args:
-        response: The LLM's response text
-
-    Returns:
-        dict with 'safe', 'issues', and 'redacted' keys
-    """
     issues = []
     redacted = response
 
-    # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "phone_number": r"\b0\d{9,10}\b",
+        "email": r"\b[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}\b",
+        "national_id": r"\b\d{9}\b|\b\d{12}\b",
+        "api_key": r"\bsk-[a-zA-Z0-9-]+\b",
+        "password": r"\bpassword\s*(?::|=|\bis\b)\s*\S+",
     }
 
     for name, pattern in PII_PATTERNS.items():
         matches = re.findall(pattern, response, re.IGNORECASE)
+
         if matches:
             issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+            redacted = re.sub(
+                pattern,
+                "[REDACTED]",
+                redacted,
+                flags=re.IGNORECASE,
+            )
 
     return {
         "safe": len(issues) == 0,
@@ -172,16 +171,41 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Check and redact PII / secrets
+        filter_result = content_filter(response_text)
 
-        return llm_response  # TODO: modify if needed
+        if not filter_result["safe"]:
+            self.redacted_count += 1
+
+            llm_response.content = types.Content(
+                role="model",
+                parts=[
+                    types.Part.from_text(
+                        text=filter_result["redacted"]
+                    )
+                ],
+            )
+
+        # 2. Optional LLM-as-Judge check
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(
+                filter_result["redacted"]
+            )
+
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text="I'm sorry, but I cannot provide this response because it did not pass the safety check."
+                        )
+                    ],
+                )
+
+        # 3. Return the original or modified response
+        return llm_response
 
 
 # ============================================================
@@ -220,9 +244,54 @@ def load_lab_pii_dataset():
     with path.open(encoding="utf-8") as f:
         return json.load(f)
 
+
+async def test_output_plugin():
+    """Test OutputGuardrailPlugin with sensitive and safe responses."""
+
+    plugin = OutputGuardrailPlugin(use_llm_judge=False)
+
+    test_messages = [
+        "The savings rate is 4.25% per year.",
+        "Contact us at 0901234567 or test@vinbank.com.",
+        "Admin password is admin123 and API key is sk-secret-2024.",
+    ]
+
+    print("Testing OutputGuardrailPlugin:")
+
+    for msg in test_messages:
+        llm_response = LlmResponse(
+            content=types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=msg)],
+            )
+        )
+
+        result = await plugin.after_model_callback(
+            callback_context=None,
+            llm_response=llm_response,
+        )
+
+        output_text = "".join(
+            part.text
+            for part in result.content.parts
+            if part.text
+        )
+
+        print(f"  Original: {msg}")
+        print(f"  Output:   {output_text}")
+
+    print(
+        f"\nStats: {plugin.redacted_count} redacted / "
+        f"{plugin.blocked_count} blocked / "
+        f"{plugin.total_count} total"
+    )
+
 if __name__ == "__main__":
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
     test_content_filter()
+
+
+

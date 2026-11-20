@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -51,14 +52,26 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
+
+    # Chuẩn hóa Unicode và loại bỏ ký tự vô hình
+    normalized = user_input.casefold()
+    normalized = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]", "", normalized)
+    
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        r"ignore\s+(all\s+)?(previous|above|prior)\s+instructions?",
+        r"you\s+are\s+now\b",
+        r"system\s+prompt",
+        r"reveal\s+(your\s+)?(instructions|prompt)",
+        r"pretend\s+(you\s+are|to\s+be)",
+        r"act\s+as\s+(an?\s+)?unrestricted",
+        r"disregard\s+(all\s+)?(previous|above)\s+instructions?",
+        r"bypass\s+(your\s+)?(rules|restrictions|safety)",
+        r"developer\s+message",
+        r"forget\s+(all\s+)?(previous|prior)\s+instructions?",
     ]
 
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, normalized, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,15 +97,35 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    def normalize(text: str) -> str:
+        text = text.casefold()
+        text = unicodedata.normalize("NFD", text)
+        text = "".join(
+            char for char in text
+            if unicodedata.category(char) != "Mn"
+        )
+        return re.sub(r"\s+", " ", text).strip()
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    normalized_input = normalize(user_input)
 
-    pass  # Replace with your implementation
+    def contains_topic(topic: str) -> bool:
+        normalized_topic = normalize(topic)
+        pattern = (
+            r"(?<!\w)"
+            + re.escape(normalized_topic).replace(r"\ ", r"\s+")
+            + r"(?!\w)"
+        )
+        return re.search(pattern, normalized_input) is not None
 
+    # Ưu tiên chặn các chủ đề bị cấm
+    if any(contains_topic(topic) for topic in BLOCKED_TOPICS):
+        return "BLOCK"
+
+    # Chỉ cho phép nội dung thuộc danh sách chủ đề ngân hàng
+    if any(contains_topic(topic) for topic in ALLOWED_TOPICS):
+        return "ALLOW"
+
+    return "BLOCK"
 
 # ============================================================
 # Implement InputGuardrailPlugin
@@ -144,14 +177,22 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # 1. Check for prompt injection
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Your message was blocked because it contains a potential prompt injection."
+            )
 
-        pass  # Replace with your implementation
+        # 2. Check whether the request is within the banking domain
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Your request is outside the supported banking topics."
+            )
+
+        # 3. Allow safe and relevant messages to reach the agent
+        return None
 
 
 # ============================================================
